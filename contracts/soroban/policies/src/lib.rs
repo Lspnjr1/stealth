@@ -62,7 +62,7 @@ pub struct PolicyDecision {
 }
 
 /// Storage Key Migration Notes:
-/// 
+///
 /// The `DataKey` enum defines the keys for persistent storage in the Soroban environment.
 /// - When introducing new variants, **ALWAYS append them to the end** of this enum to preserve
 ///   backward compatibility with Soroban's underlying XDR serialization.
@@ -383,8 +383,18 @@ impl PoliciesContract {
         }
     }
 
+    /// Increments the policy version for the given owner.
+    ///
+    /// # Panic-Free Guarantee
+    ///
+    /// Uses saturating arithmetic to prevent overflow panic at `u32::MAX`.
+    /// If the version reaches `u32::MAX`, it saturates and remains at that value.
+    /// This is acceptable because:
+    /// - Reaching `u32::MAX` versions requires ~4 billion policy mutations
+    /// - The version still increments correctly for all practical use cases
+    /// - No runtime panic can occur from arithmetic overflow
     fn bump_version(env: &Env, owner: &Address) -> u32 {
-        let version = Self::policy_version(env.clone(), owner.clone()) + 1;
+        let version = Self::policy_version(env.clone(), owner.clone()).saturating_add(1);
         env.storage()
             .persistent()
             .set(&DataKey::PolicyVersion(owner.clone()), &version);
@@ -884,7 +894,7 @@ mod proptests {
             prop_assert!(decision.allowed);
             prop_assert_eq!(decision.reason, PolicyReason::SenderAllowed);
         }
-        
+
         #[test]
         fn property_tier_satisfaction_trumps_default_policy(
             postage in 0i128..10_000_000_000i128,
@@ -918,7 +928,7 @@ mod proptests {
 
             // Tier evaluation happens after verification & receipt checks.
             let decision = client.evaluate(&owner, &sender, &verified, &postage, &receipt);
-            
+
             if require_verified && !verified {
                 prop_assert!(!decision.allowed);
                 prop_assert_eq!(decision.reason, PolicyReason::VerificationRequired);
@@ -935,5 +945,336 @@ mod proptests {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Panic-free error handling audit tests
+//
+// These tests verify that the contract handles all error conditions gracefully
+// without panicking, returning proper Result types or safe default values.
+// This is critical for ledger integration reliability.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod panic_free_audit {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    // -----------------------------------------------------------------------
+    // Validation Error Handling (no panics, returns Err)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn negative_postage_in_policy_returns_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PoliciesContract, ());
+        let client = PoliciesContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        let result = client.try_set_policy(
+            &owner,
+            &MailboxPolicy {
+                allow_unknown: true,
+                require_verified: false,
+                require_receipt: false,
+                minimum_postage: -1,
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), Ok(Error::InvalidPostage));
+    }
+
+    #[test]
+    fn negative_postage_in_tier_returns_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PoliciesContract, ());
+        let client = PoliciesContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let sender = Address::generate(&env);
+
+        let result = client.try_set_sender_tier(&owner, &sender, &-100);
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), Ok(Error::InvalidPostage));
+    }
+
+    #[test]
+    fn unauthorized_delegate_returns_error_not_panic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PoliciesContract, ());
+        let client = PoliciesContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let unauthorized = Address::generate(&env);
+        let sender = Address::generate(&env);
+
+        // Attempt to set policy as unauthorized delegate
+        let policy_result = client.try_set_policy_as(
+            &owner,
+            &unauthorized,
+            &MailboxPolicy {
+                allow_unknown: true,
+                require_verified: false,
+                require_receipt: false,
+                minimum_postage: 0,
+            },
+        );
+        assert!(policy_result.is_err());
+        assert_eq!(policy_result.unwrap_err(), Ok(Error::UnauthorizedDelegate));
+
+        // Attempt to set sender rule as unauthorized delegate
+        let rule_result =
+            client.try_set_sender_rule_as(&owner, &unauthorized, &sender, &SenderRule::Allow);
+        assert!(rule_result.is_err());
+        assert_eq!(rule_result.unwrap_err(), Ok(Error::UnauthorizedDelegate));
+
+        // Attempt to set sender tier as unauthorized delegate
+        let tier_result = client.try_set_sender_tier_as(&owner, &unauthorized, &sender, &100);
+        assert!(tier_result.is_err());
+        assert_eq!(tier_result.unwrap_err(), Ok(Error::UnauthorizedDelegate));
+    }
+
+    // -----------------------------------------------------------------------
+    // Storage Default Handling (no panics on missing data)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn missing_policy_returns_default_not_panic() {
+        let env = Env::default();
+        let contract_id = env.register(PoliciesContract, ());
+        let client = PoliciesContractClient::new(&env, &contract_id);
+        let nonexistent_owner = Address::generate(&env);
+
+        // Should return default policy, not panic
+        let policy = client.get_policy(&nonexistent_owner);
+        assert!(!policy.allow_unknown);
+        assert!(policy.require_verified);
+        assert!(!policy.require_receipt);
+        assert_eq!(policy.minimum_postage, 0);
+    }
+
+    #[test]
+    fn missing_version_returns_zero_not_panic() {
+        let env = Env::default();
+        let contract_id = env.register(PoliciesContract, ());
+        let client = PoliciesContractClient::new(&env, &contract_id);
+        let nonexistent_owner = Address::generate(&env);
+
+        // Should return 0, not panic
+        let version = client.policy_version(&nonexistent_owner);
+        assert_eq!(version, 0);
+    }
+
+    #[test]
+    fn missing_sender_rule_returns_default_not_panic() {
+        let env = Env::default();
+        let contract_id = env.register(PoliciesContract, ());
+        let client = PoliciesContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let unknown_sender = Address::generate(&env);
+
+        // Should return Default, not panic
+        let rule = client.sender_rule(&owner, &unknown_sender);
+        assert_eq!(rule, SenderRule::Default);
+    }
+
+    #[test]
+    fn missing_sender_tier_returns_none_not_panic() {
+        let env = Env::default();
+        let contract_id = env.register(PoliciesContract, ());
+        let client = PoliciesContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let unknown_sender = Address::generate(&env);
+
+        // Should return None, not panic
+        let tier = client.sender_tier(&owner, &unknown_sender);
+        assert!(tier.is_none());
+    }
+
+    #[test]
+    fn missing_delegate_scope_returns_no_permissions_not_panic() {
+        let env = Env::default();
+        let contract_id = env.register(PoliciesContract, ());
+        let client = PoliciesContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let unknown_delegate = Address::generate(&env);
+
+        // Should return no permissions, not panic
+        let scope = client.delegate_scope(&owner, &unknown_delegate);
+        assert!(!scope.can_set_policy);
+        assert!(!scope.can_set_senders);
+    }
+
+    // -----------------------------------------------------------------------
+    // Arithmetic Overflow Protection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn version_saturates_at_max_u32_no_overflow_panic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PoliciesContract, ());
+        let client = PoliciesContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+
+        // Manually set version to u32::MAX - 1 to test saturation
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::PolicyVersion(owner.clone()), &(u32::MAX - 1));
+        });
+
+        // First bump should work (MAX-1 -> MAX)
+        client.set_policy(
+            &owner,
+            &MailboxPolicy {
+                allow_unknown: true,
+                require_verified: false,
+                require_receipt: false,
+                minimum_postage: 0,
+            },
+        );
+        assert_eq!(client.policy_version(&owner), u32::MAX);
+
+        // Second bump should saturate at MAX (no panic)
+        client.set_policy(
+            &owner,
+            &MailboxPolicy {
+                allow_unknown: false,
+                require_verified: true,
+                require_receipt: false,
+                minimum_postage: 100,
+            },
+        );
+        // Should still be MAX due to saturation, not panic
+        assert_eq!(client.policy_version(&owner), u32::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // Evaluate function handles all edge cases without panic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn evaluate_handles_all_combinations_without_panic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PoliciesContract, ());
+        let client = PoliciesContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let sender = Address::generate(&env);
+
+        // Test with no policy set (default policy)
+        let decision = client.evaluate(&owner, &sender, &false, &0, &false);
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason, PolicyReason::UnknownSendersDisabled);
+
+        // Test with zero postage requirement
+        client.set_policy(
+            &owner,
+            &MailboxPolicy {
+                allow_unknown: true,
+                require_verified: false,
+                require_receipt: false,
+                minimum_postage: 0,
+            },
+        );
+        let decision = client.evaluate(&owner, &sender, &false, &0, &false);
+        assert!(decision.allowed);
+
+        // Test with i128::MAX postage (extreme value)
+        let decision = client.evaluate(&owner, &sender, &true, &i128::MAX, &true);
+        assert!(decision.allowed);
+
+        // Test with zero postage against high requirement
+        client.set_policy(
+            &owner,
+            &MailboxPolicy {
+                allow_unknown: true,
+                require_verified: false,
+                require_receipt: false,
+                minimum_postage: i128::MAX,
+            },
+        );
+        let decision = client.evaluate(&owner, &sender, &true, &0, &true);
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason, PolicyReason::InsufficientPostage);
+    }
+
+    // -----------------------------------------------------------------------
+    // Delegate scope removal is panic-free
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn removing_delegate_scope_is_panic_free() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PoliciesContract, ());
+        let client = PoliciesContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let delegate = Address::generate(&env);
+
+        // Grant permissions
+        client.set_delegate(
+            &owner,
+            &delegate,
+            &DelegateScope {
+                can_set_policy: true,
+                can_set_senders: true,
+            },
+        );
+
+        // Revoke permissions (should remove from storage, not panic)
+        client.set_delegate(
+            &owner,
+            &delegate,
+            &DelegateScope {
+                can_set_policy: false,
+                can_set_senders: false,
+            },
+        );
+
+        // Verify removed
+        let scope = client.delegate_scope(&owner, &delegate);
+        assert!(!scope.can_set_policy);
+        assert!(!scope.can_set_senders);
+
+        // Removing again should not panic
+        client.set_delegate(
+            &owner,
+            &delegate,
+            &DelegateScope {
+                can_set_policy: false,
+                can_set_senders: false,
+            },
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sender rule reset is panic-free
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resetting_sender_rule_to_default_is_panic_free() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(PoliciesContract, ());
+        let client = PoliciesContractClient::new(&env, &contract_id);
+        let owner = Address::generate(&env);
+        let sender = Address::generate(&env);
+
+        // Set rule
+        client.set_sender_rule(&owner, &sender, &SenderRule::Allow);
+        assert_eq!(client.sender_rule(&owner, &sender), SenderRule::Allow);
+
+        // Reset to default (should remove from storage, not panic)
+        client.set_sender_rule(&owner, &sender, &SenderRule::Default);
+        assert_eq!(client.sender_rule(&owner, &sender), SenderRule::Default);
+
+        // Resetting again should not panic
+        client.set_sender_rule(&owner, &sender, &SenderRule::Default);
+        assert_eq!(client.sender_rule(&owner, &sender), SenderRule::Default);
     }
 }
