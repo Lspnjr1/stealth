@@ -31,3 +31,37 @@ deterministic: block, allow, tier, then mailbox default.
 2. Allow always admits the sender.
 3. Tier applies sender-specific postage after verification and receipt requirements.
 4. Mailbox default applies to unknown/default senders.
+
+## Panic-Free Error Handling
+
+This contract is designed for ledger integration reliability with comprehensive panic-free guarantees:
+
+### Error Return Types
+
+All mutable operations return `Result<(), Error>` instead of panicking:
+
+| Error Code | Value | Condition |
+|------------|-------|-----------|
+| `InvalidPostage` | 1 | Negative postage in policy or tier |
+| `UnauthorizedDelegate` | 2 | Actor lacks required delegate scope |
+
+### Storage Default Handling
+
+All read operations return safe defaults when data is missing:
+
+| Function | Default Value |
+|----------|---------------|
+| `get_policy` | `{ allow_unknown: false, require_verified: true, require_receipt: false, minimum_postage: 0 }` |
+| `policy_version` | `0` |
+| `sender_rule` | `SenderRule::Default` |
+| `sender_tier` | `None` |
+| `delegate_scope` | `{ can_set_policy: false, can_set_senders: false }` |
+
+### Arithmetic Safety
+
+- **Version overflow**: Uses `saturating_add` to prevent panic at `u32::MAX`
+- **Postage comparison**: Safe `i128` comparisons with no overflow risk
+
+### Authorization
+
+The `require_auth()` calls will abort the transaction on auth failure. This is expected Soroban behavior and not considered a bug—failed authorization should halt execution.
