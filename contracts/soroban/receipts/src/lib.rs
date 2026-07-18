@@ -268,7 +268,8 @@ impl ReceiptsContract {
             read_at: receipt.read_at,
         };
         let result = if receipt.read_at.is_some() {
-            LifecycleContractClient::new(env, &guard).try_verify_read(&message_id, &lifecycle_receipt)
+            LifecycleContractClient::new(env, &guard)
+                .try_verify_read(&message_id, &lifecycle_receipt)
         } else {
             LifecycleContractClient::new(env, &guard)
                 .try_verify_delivered(&message_id, &lifecycle_receipt)
@@ -285,8 +286,12 @@ impl ReceiptsContract {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation, Ledger},
-        symbol_short, IntoVal,
+        symbol_short,
+        testutils::{
+            Address as _, AuthorizedFunction, AuthorizedInvocation, Ledger, MockAuth,
+            MockAuthInvoke,
+        },
+        IntoVal,
     };
     use stealth_lifecycle::{LifecycleContract, LifecycleContractClient};
     use stealth_policies::{MailboxPolicy, PoliciesContract, PoliciesContractClient};
@@ -469,6 +474,214 @@ mod test {
                     sub_invocations: [].into(),
                 }
             )]
+        );
+    }
+
+    #[test]
+    fn delivered_fails_without_sender_authorization() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(ReceiptsContract, ());
+        let client = ReceiptsContractClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let message_id = hash(&env, 7);
+        configure_lifecycle(&env, &contract_id, &message_id, &sender, &recipient);
+
+        env.set_auths(&[]);
+        assert!(client
+            .try_delivered(&message_id, &hash(&env, 8), &1, &sender, &recipient)
+            .is_err());
+
+        env.mock_all_auths();
+        assert_eq!(
+            client.try_get(&message_id).unwrap_err().unwrap(),
+            Error::ReceiptNotFound
+        );
+    }
+
+    #[test]
+    fn delivered_fails_when_only_recipient_authorizes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(ReceiptsContract, ());
+        let client = ReceiptsContractClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let message_id = hash(&env, 7);
+        let payload_hash = hash(&env, 8);
+        configure_lifecycle(&env, &contract_id, &message_id, &sender, &recipient);
+
+        env.mock_auths(&[MockAuth {
+            address: &recipient,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "delivered",
+                args: (
+                    message_id.clone(),
+                    payload_hash.clone(),
+                    1_u32,
+                    sender.clone(),
+                    recipient.clone(),
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client
+            .try_delivered(&message_id, &payload_hash, &1, &sender, &recipient)
+            .is_err());
+    }
+
+    #[test]
+    fn delivered_authorization_is_bound_to_exact_arguments() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(ReceiptsContract, ());
+        let client = ReceiptsContractClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let message_id = hash(&env, 7);
+        let payload_hash = hash(&env, 8);
+        configure_lifecycle(&env, &contract_id, &message_id, &sender, &recipient);
+
+        // The sender signed a commitment to payload hash 8; a relay cannot
+        // reuse that signature to record a different payload hash.
+        env.mock_auths(&[MockAuth {
+            address: &sender,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "delivered",
+                args: (
+                    message_id.clone(),
+                    payload_hash.clone(),
+                    1_u32,
+                    sender.clone(),
+                    recipient.clone(),
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client
+            .try_delivered(&message_id, &hash(&env, 9), &1, &sender, &recipient)
+            .is_err());
+    }
+
+    #[test]
+    fn read_fails_without_recipient_authorization() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(ReceiptsContract, ());
+        let client = ReceiptsContractClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let message_id = hash(&env, 7);
+        configure_lifecycle(&env, &contract_id, &message_id, &sender, &recipient);
+        client.delivered(&message_id, &hash(&env, 8), &1, &sender, &recipient);
+
+        env.set_auths(&[]);
+        assert!(client.try_read(&message_id).is_err());
+
+        env.mock_all_auths();
+        assert_eq!(client.get(&message_id).read_at, None);
+    }
+
+    #[test]
+    fn read_fails_when_sender_authorizes_instead_of_recipient() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(ReceiptsContract, ());
+        let client = ReceiptsContractClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let message_id = hash(&env, 7);
+        configure_lifecycle(&env, &contract_id, &message_id, &sender, &recipient);
+        client.delivered(&message_id, &hash(&env, 8), &1, &sender, &recipient);
+
+        // The read authorizer comes from stored receipt state, not from the
+        // caller, so the sender cannot forge a read acknowledgement.
+        env.mock_auths(&[MockAuth {
+            address: &sender,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "read",
+                args: (message_id.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_read(&message_id).is_err());
+
+        env.mock_all_auths();
+        assert_eq!(client.get(&message_id).read_at, None);
+    }
+
+    #[test]
+    fn read_of_unknown_message_fails_without_needing_authorization() {
+        let env = Env::default();
+        let contract_id = env.register(ReceiptsContract, ());
+        let client = ReceiptsContractClient::new(&env, &contract_id);
+
+        env.set_auths(&[]);
+        assert_eq!(
+            client.try_read(&hash(&env, 7)).unwrap_err().unwrap(),
+            Error::ReceiptNotFound
+        );
+    }
+
+    #[test]
+    fn get_is_public_and_requires_no_authorization() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(ReceiptsContract, ());
+        let client = ReceiptsContractClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let message_id = hash(&env, 7);
+        configure_lifecycle(&env, &contract_id, &message_id, &sender, &recipient);
+        client.delivered(&message_id, &hash(&env, 8), &1, &sender, &recipient);
+
+        env.set_auths(&[]);
+        let fetched = client.get(&message_id);
+        assert_eq!(fetched.message_id, message_id);
+        assert_eq!(env.auths(), []);
+    }
+
+    #[test]
+    fn configure_guard_is_first_write_wins_and_immutable() {
+        let env = Env::default();
+        let contract_id = env.register(ReceiptsContract, ());
+        let client = ReceiptsContractClient::new(&env, &contract_id);
+        let guard = Address::generate(&env);
+        let attacker_guard = Address::generate(&env);
+
+        client.configure_guard(&guard);
+        assert_eq!(
+            client
+                .try_configure_guard(&attacker_guard)
+                .unwrap_err()
+                .unwrap(),
+            Error::GuardAlreadyConfigured
+        );
+        assert_eq!(client.guard(), guard);
+    }
+
+    #[test]
+    fn delivered_fails_before_guard_is_configured() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(ReceiptsContract, ());
+        let client = ReceiptsContractClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let message_id = hash(&env, 7);
+
+        assert_eq!(
+            client
+                .try_delivered(&message_id, &hash(&env, 8), &1, &sender, &recipient)
+                .unwrap_err()
+                .unwrap(),
+            Error::GuardNotConfigured
         );
     }
 }
